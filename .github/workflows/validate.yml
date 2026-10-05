@@ -1,0 +1,26 @@
+name: Validate Worker
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate workflow files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/build-flutter.yml
+          test -f .github/workflows/build-android.yml
+          test -f .github/workflows/validate.yml
+          grep -q "workflow_dispatch:" .github/workflows/build-flutter.yml
+          grep -q "workflow_dispatch:" .github/workflows/build-android.yml
+          echo "All GitHub Actions workers are present."
