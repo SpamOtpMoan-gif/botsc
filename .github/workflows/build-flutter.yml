@@ -1,0 +1,204 @@
+name: Build Flutter
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID build dari bot"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: true
+        type: string
+      payload:
+        description: 'JSON: {"mode":"zip","url":"...","buildType":"release","tag":"..."}'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sc-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK - ${{ inputs.jobId }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout worker
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: payload
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          echo "$PAYLOAD" | jq -e . >/dev/null
+          MODE="$(echo "$PAYLOAD" | jq -r '.mode // "zip"')"
+          URL="$(echo "$PAYLOAD" | jq -r '.url // empty')"
+          BUILD_TYPE="$(echo "$PAYLOAD" | jq -r '.buildType // "release"')"
+          APP_NAME="$(echo "$PAYLOAD" | jq -r '.appName // "Web2APK"')"
+          ICON_URL="$(echo "$PAYLOAD" | jq -r '.iconUrl // empty')"
+          test -n "$URL" || { echo "payload.url kosong"; exit 1; }
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "icon_url=$ICON_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare ZIP Flutter project
+        if: steps.payload.outputs.mode == 'zip'
+        env:
+          SOURCE_URL: ${{ steps.payload.outputs.url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          curl -fL --retry 5 --retry-delay 3 "$SOURCE_URL" -o /tmp/source.zip
+          unzip -q /tmp/source.zip -d source
+
+          if [ "$(find source -mindepth 1 -maxdepth 1 | wc -l)" = "1" ] && \
+             [ -d "$(find source -mindepth 1 -maxdepth 1 -type d | head -1)" ]; then
+            ROOT_DIR="$(find source -mindepth 1 -maxdepth 1 -type d | head -1)"
+            shopt -s dotglob
+            cp -a "$ROOT_DIR"/. source/
+            rm -rf "$ROOT_DIR"
+          fi
+
+          test -f source/pubspec.yaml || {
+            echo "pubspec.yaml tidak ditemukan."
+            exit 1
+          }
+
+      - name: Create Web2APK project
+        if: steps.payload.outputs.mode == 'url'
+        env:
+          WEB_URL: ${{ steps.payload.outputs.url }}
+          APP_NAME: ${{ steps.payload.outputs.app_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source
+          cd source
+          flutter create --platforms=android --org com.sc.worker web2apk
+          cd web2apk
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re
+          p=Path("pubspec.yaml")
+          s=p.read_text()
+          s=re.sub(r'(^dependencies:\s*$)', r'\1\n  webview_flutter: ^4.10.0', s, flags=re.M)
+          p.write_text(s)
+
+          main=Path("lib/main.dart")
+          url=os.environ["WEB_URL"].replace("\\","\\\\").replace("'","\\'")
+          name=os.environ["APP_NAME"].replace("\\","\\\\").replace("'","\\'")
+          main.write_text(f"""import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const Web2ApkApp());
+          }}
+
+          class Web2ApkApp extends StatefulWidget {{
+            const Web2ApkApp({{super.key}});
+            @override
+            State<Web2ApkApp> createState() => _Web2ApkAppState();
+          }}
+
+          class _Web2ApkAppState extends State<Web2ApkApp> {{
+            late final WebViewController controller;
+            @override
+            void initState() {{
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onNavigationRequest: (request) => NavigationDecision.navigate,
+                  ),
+                )
+                ..loadRequest(Uri.parse('{url}'));
+            }}
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: '{name}',
+                home: Scaffold(
+                  body: SafeArea(child: WebViewWidget(controller: controller)),
+                ),
+              );
+            }}
+          }}
+          """)
+          PY
+
+          cd ../..
+          test -f source/web2apk/pubspec.yaml
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          if [ -f pubspec.yaml ]; then
+            flutter pub get
+          else
+            cd web2apk
+            flutter pub get
+          fi
+
+      - name: Build release/debug/profile
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ steps.payload.outputs.build_type }}
+        run: |
+          set -euo pipefail
+          if [ -f source/pubspec.yaml ]; then
+            cd source
+          else
+            cd source/web2apk
+          fi
+
+          case "$BUILD_TYPE" in
+            debug) flutter build apk --debug ;;
+            profile) flutter build apk --profile ;;
+            *) flutter build apk --release ;;
+          esac
+
+      - name: Collect APK
+        shell: bash
+        env:
+          JOB_ID: ${{ inputs.jobId }}
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          APK="$(find source -type f -path '*/build/app/outputs/flutter-apk/*.apk' | head -1)"
+          test -n "$APK" || { echo "APK tidak ditemukan"; exit 1; }
+          cp "$APK" "output/${JOB_ID}.apk"
+          ls -lh output/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: output/${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 7
