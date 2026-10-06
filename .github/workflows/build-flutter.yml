@@ -1,0 +1,334 @@
+name: Flutter Build Worker v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Unique build/job ID"
+        required: true
+        type: string
+      userId:
+        description: "Telegram user ID"
+        required: true
+        type: string
+      payload:
+        description: "JSON payload: url, buildType, flutterVersion, callbackUrl, ... "
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PAYLOAD: ${{ inputs.payload }}
+      JOB_ID: ${{ inputs.jobId }}
+
+    steps:
+      - name: 00 • Initialize
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source" "$RUNNER_TEMP/output" "$RUNNER_TEMP/work"
+          echo "0" > "$RUNNER_TEMP/work/progress"
+          echo "INITIALIZING" > "$RUNNER_TEMP/work/status"
+          echo "::notice title=BUILD_PROGRESS::0|INITIALIZING|Menyiapkan build worker"
+
+      - name: 05 • Read payload
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          p=json.loads(os.environ["PAYLOAD"])
+          def out(k, v):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"{k}={v}\n")
+          url=p.get("url")
+          if not url: raise SystemExit("payload.url tidak ditemukan")
+          mode=str(p.get("buildType") or "release").lower()
+          if mode not in ("debug","profile","release"): mode="release"
+          flutter=str(p.get("flutterVersion") or "").strip()
+          out("url", url)
+          out("mode", mode)
+          out("flutter", flutter)
+          out("callback", str(p.get("callbackUrl") or ""))
+          print("Build mode:", mode)
+          print("Flutter:", flutter or "stable/latest")
+
+      - name: 10 • Download source
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::5|DOWNLOAD|Mengunduh source ZIP"
+          python3 - <<'PY'
+          import os, urllib.request
+          url=os.environ["PAYLOAD"]
+          import json
+          p=json.loads(url)
+          target=os.path.join(os.environ["RUNNER_TEMP"],"source.zip")
+          req=urllib.request.Request(p["url"],headers={"User-Agent":"duta-script-flutter-worker/2"})
+          with urllib.request.urlopen(req,timeout=180) as r, open(target,"wb") as f:
+              while True:
+                  b=r.read(1024*1024)
+                  if not b: break
+                  f.write(b)
+          print("Downloaded:", os.path.getsize(target),"bytes")
+          PY
+
+      - name: 15 • Extract source safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::15|EXTRACT|Membuka project files"
+          python3 - <<'PY'
+          import os, zipfile
+          src=os.path.join(os.environ["RUNNER_TEMP"],"source.zip")
+          dst=os.path.join(os.environ["RUNNER_TEMP"],"source")
+          root=os.path.realpath(dst)
+          with zipfile.ZipFile(src) as z:
+              for info in z.infolist():
+                  name=info.filename
+                  out=os.path.realpath(os.path.join(dst,name))
+                  if not (out==root or out.startswith(root+os.sep)):
+                      raise SystemExit("Unsafe ZIP path: "+name)
+              z.extractall(dst)
+          print("Extracted:",dst)
+          PY
+
+      - name: 20 • Locate Flutter project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/source"
+          PROJECT=""
+          if [ -f "$ROOT/pubspec.yaml" ]; then
+            PROJECT="$ROOT"
+          else
+            PROJECT="$(find "$ROOT" -maxdepth 6 -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
+          fi
+          [ -n "$PROJECT" ] && [ -f "$PROJECT/pubspec.yaml" ] || {
+            echo "pubspec.yaml tidak ditemukan"; exit 1;
+          }
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "::notice title=BUILD_PROGRESS::20|DETECT|Flutter project ditemukan"
+
+      - name: 25 • Read Flutter compatibility hints
+        id: hints
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os,re
+          p="pubspec.yaml"
+          s=open(p,encoding="utf-8",errors="ignore").read()
+          m=re.search(r'(^|\n)environment:\s*\n(?:.*\n)*?\s*sdk:\s*[\'"]([^\'"]+)',s)
+          print("Dart SDK constraint:",m.group(2) if m else "unknown")
+          PY
+
+      - name: 30 • Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: 35 • Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.config.outputs.flutter }}
+          cache: true
+
+      - name: 40 • Flutter doctor
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: |
+          echo "::notice title=BUILD_PROGRESS::25|FLUTTER|Memeriksa Flutter & Android toolchain"
+          flutter --version
+          flutter doctor -v
+
+      - name: 45 • Compatibility preflight
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::30|COMPATIBILITY|Memeriksa Gradle, AGP, dan Android config"
+          if [ -f android/gradle/wrapper/gradle-wrapper.properties ]; then
+            grep -E 'distributionUrl=' android/gradle/wrapper/gradle-wrapper.properties || true
+          fi
+          grep -R -nE 'com\.android\.tools\.build:gradle|com\.android\.application|com\.android\.library' android 2>/dev/null | head -30 || true
+
+      - name: 50 • Normalize Gradle wrapper when safe
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$FILE" ]; then
+            # Flutter current stable rejects Gradle < 8.14. Do not downgrade projects
+            # that explicitly request an older Flutter toolchain.
+            FLUTTER_VERSION="${{ steps.config.outputs.flutter }}"
+            if [ -z "$FLUTTER_VERSION" ] || [[ "$FLUTTER_VERSION" == 3.3* ]] || [[ "$FLUTTER_VERSION" == 3.4* ]] || [[ "$FLUTTER_VERSION" == 3.5* ]] || [[ "$FLUTTER_VERSION" == 3.6* ]]; then
+              python3 - <<'PY'
+          import re
+          p="android/gradle/wrapper/gradle-wrapper.properties"
+          s=open(p,encoding="utf-8").read()
+          m=re.search(r'distributionUrl=.*gradle-([0-9.]+)-',s)
+          if m:
+              v=m.group(1)
+              nums=tuple(map(int,v.split(".")))
+              if nums < (8,14,0):
+                  s=re.sub(r'gradle-[0-9.]+-', 'gradle-8.14-', s)
+                  open(p,"w",encoding="utf-8").write(s)
+                  print("Upgraded Gradle wrapper to 8.14")
+          PY
+            fi
+          fi
+          echo "::notice title=BUILD_PROGRESS::35|GRADLE|Gradle compatibility prepared"
+
+      - name: 55 • Flutter pub get
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::40|PUB_GET|Menginstall dependencies"
+          flutter pub get
+
+      - name: 60 • Build attempt 1
+        id: build1
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          echo "::notice title=BUILD_PROGRESS::60|BUILD|Compile APK"
+          case "${{ steps.config.outputs.mode }}" in
+            debug) flutter build apk --debug 2>&1 | tee "$RUNNER_TEMP/work/build-error-1.log" ;;
+            profile) flutter build apk --profile 2>&1 | tee "$RUNNER_TEMP/work/build-error-1.log" ;;
+            *) flutter build apk --release 2>&1 | tee "$RUNNER_TEMP/work/build-error-1.log" ;;
+          esac
+
+      - name: 65 • Auto-fix with constrained Groq
+        id: autofix
+        if: steps.build1.outcome == 'failure'
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::70|AI_AUTO_FIX|Menganalisis error build"
+          if [ -z "${GROQ_API_KEY:-}" ]; then
+            echo "GROQ_API_KEY belum diset; melewati AI auto-fix."
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import os, json, urllib.request
+          log=open(os.path.join(os.environ["RUNNER_TEMP"],"work","build-error-1.log"),encoding="utf-8",errors="ignore").read()
+          log=log[-24000:]
+          prompt="""You are a Flutter/Android CI repair assistant.
+          Return ONLY JSON:
+          {"diagnosis":"...","patches":[{"path":"relative/path","find":"exact text","replace":"replacement"}]}
+          Rules:
+          - Never return shell commands.
+          - Only allow paths under android/ or pubspec.yaml.
+          - Prefer minimal compatibility patches.
+          - For Gradle 8.12 vs Flutter >=8.14, update android/gradle/wrapper/gradle-wrapper.properties.
+          - Do not modify application Dart source to fix Gradle/toolchain errors.
+          - Do not add secrets.
+          Build log:
+          """+log
+          body=json.dumps({"model":"openai/gpt-oss-120b","temperature":0,"messages":[
+              {"role":"system","content":"Return valid JSON only."},
+              {"role":"user","content":prompt}]}).encode()
+          req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",data=body,
+              headers={"Authorization":"Bearer "+os.environ["GROQ_API_KEY"],"Content-Type":"application/json"})
+          with urllib.request.urlopen(req,timeout=90) as r:
+              data=json.load(r)
+          content=data["choices"][0]["message"]["content"]
+          if "```" in content:
+              content=content.replace("```json","").replace("```","").strip()
+          open(os.path.join(os.environ["RUNNER_TEMP"],"work","groq.json"),"w",encoding="utf-8").write(content)
+          print(content)
+          PY
+
+          python3 - <<'PY'
+          import json, os
+          root=os.path.realpath(".")
+          data=json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"work","groq.json"),encoding="utf-8"))
+          for patch in data.get("patches",[]):
+              path=patch.get("path","")
+              if not (path=="pubspec.yaml" or path.startswith("android/")):
+                  raise SystemExit("Blocked unsafe AI patch: "+path)
+              full=os.path.realpath(path)
+              if not (full==root or full.startswith(root+os.sep)):
+                  raise SystemExit("Blocked path traversal")
+              s=open(full,encoding="utf-8").read()
+              find=patch.get("find","")
+              repl=patch.get("replace","")
+              if not find or find not in s:
+                  raise SystemExit("Patch context not found: "+path)
+              open(full,"w",encoding="utf-8").write(s.replace(find,repl,1))
+              print("Applied:",path)
+          PY
+
+      - name: 75 • Re-run pub get after AI patch
+        if: steps.build1.outcome == 'failure' && steps.autofix.outcome == 'success'
+        working-directory: ${{ steps.locate.outputs.project }}
+        run: |
+          flutter pub get
+
+      - name: 80 • Build attempt 2
+        id: build2
+        if: steps.build1.outcome == 'failure'
+        working-directory: ${{ steps.locate.outputs.project }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          echo "::notice title=BUILD_PROGRESS::85|REBUILD|Mencoba build ulang setelah auto-fix"
+          case "${{ steps.config.outputs.mode }}" in
+            debug) flutter build apk --debug 2>&1 | tee "$RUNNER_TEMP/work/build-error-2.log" ;;
+            profile) flutter build apk --profile 2>&1 | tee "$RUNNER_TEMP/work/build-error-2.log" ;;
+            *) flutter build apk --release 2>&1 | tee "$RUNNER_TEMP/work/build-error-2.log" ;;
+          esac
+
+      - name: 90 • Final verify
+        if: steps.build1.outcome == 'success' || steps.build2.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=BUILD_PROGRESS::97|VERIFY|Memeriksa APK"
+          APK="$(find "${{ steps.locate.outputs.project }}/build/app/outputs/apk" -type f -name '*.apk' -print -quit || true)"
+          [ -n "$APK" ] || { echo "APK tidak ditemukan"; exit 1; }
+          cp "$APK" "$RUNNER_TEMP/output/app-${{ inputs.jobId }}.apk"
+          sha256sum "$RUNNER_TEMP/output/app-${{ inputs.jobId }}.apk"
+
+      - name: 100 • Upload APK
+        if: steps.build1.outcome == 'success' || steps.build2.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/output/*.apk
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build failed summary
+        if: steps.build1.outcome == 'failure' && steps.build2.outcome != 'success'
+        shell: bash
+        run: |
+          echo "::error title=BUILD_FAILED::Build gagal setelah auto-fix."
+          echo "=== LAST BUILD ERROR ==="
+          tail -n 160 "$RUNNER_TEMP/work/build-error-2.log" 2>/dev/null || tail -n 160 "$RUNNER_TEMP/work/build-error-1.log" || true
+          exit 1
