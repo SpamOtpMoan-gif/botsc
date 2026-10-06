@@ -1,0 +1,34 @@
+name: Validate Worker
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate GitHub Worker
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check workflow files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/build-flutter.yml
+          test -f .github/workflows/build-android.yml
+          test -f .github/workflows/validate.yml
+          grep -q "workflow_dispatch:" .github/workflows/build-flutter.yml
+          grep -q "workflow_dispatch:" .github/workflows/build-android.yml
+          grep -q "actions/setup-java@v6" .github/workflows/build-flutter.yml
+          grep -q "subosito/flutter-action@v2" .github/workflows/build-flutter.yml
+          grep -q "actions/upload-artifact@v4" .github/workflows/build-flutter.yml
+          grep -q "GROQ_API_KEY" .github/workflows/build-flutter.yml
+          echo "GitHub Workers OK."
